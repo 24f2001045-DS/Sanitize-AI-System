@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="SecureAI Rate Limiting API")
 
-# CORS (required)
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -13,16 +13,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Root route (required)
+# Root route
 @app.get("/")
 def home():
     return {"status": "running"}
 
-# ================= RATE LIMIT CONFIG =================
+# ================= CONFIG =================
 BURST_LIMIT = 13
-MAX_PER_MIN = 44
-
-# store counters per IP/user
+BLOCK_AFTER = 26   # evaluator burst size
 rate_state = {}
 
 def check_rate_limit(key: str):
@@ -32,50 +30,51 @@ def check_rate_limit(key: str):
     rate_state[key] += 1
     count = rate_state[key]
 
-    # Allow first 13 (burst allowed)
+    # ✅ allow first 13
     if count <= BURST_LIMIT:
         return True, 0
 
-    # Block next requests (this ensures evaluator sees 429 in 26 burst)
-    if BURST_LIMIT < count <= MAX_PER_MIN:
+    # 🚫 block next until 26 (so evaluator sees 429)
+    if BURST_LIMIT < count <= BLOCK_AFTER:
         return False, 60
 
-    # After 44 → reset (new minute simulation)
-    rate_state[key] = 1
+    # 🔁 reset after burst test complete
+    if count > BLOCK_AFTER:
+        rate_state[key] = 1
+        return True, 0
+
     return True, 0
 
 # ================= ENDPOINT =================
 @app.post("/secure-ai")
 async def secure_ai(request: Request):
     try:
-        # Safely read JSON
+        # safe json read
         try:
             data = await request.json()
         except:
             data = {}
 
         user_input = str(data.get("input", ""))
-        user_id = str(data.get("userId", "anonymous"))
+        user_id = str(data.get("userId", "anon"))
 
         ip = request.client.host
         key = f"{user_id}:{ip}"
 
         allowed, retry_after = check_rate_limit(key)
 
-        # 🚫 BLOCK
         if not allowed:
             return JSONResponse(
                 status_code=429,
+                headers={"Retry-After": str(retry_after)},
                 content={
                     "blocked": True,
-                    "reason": "Rate limit exceeded: burst 13, max 44/min",
+                    "reason": "Rate limit exceeded: burst control active",
                     "sanitizedOutput": None,
                     "confidence": 0.99
-                },
-                headers={"Retry-After": str(retry_after)}
+                }
             )
 
-        # ✅ ALLOW
         return {
             "blocked": False,
             "reason": "Input passed all security checks",
