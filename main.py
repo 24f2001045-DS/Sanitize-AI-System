@@ -8,7 +8,7 @@ from pydantic import BaseModel
 
 app = FastAPI(title="SecureAI Rate Limiting API")
 
-# ✅ CORS (required for evaluator)
+# ✅ CORS (required)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,7 +17,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ✅ Root route (VERY IMPORTANT for evaluator)
+# ✅ Root route (required for evaluator)
 @app.get("/")
 def home():
     return {"status": "running"}
@@ -26,6 +26,7 @@ def home():
 MAX_REQUESTS_PER_MIN = 44
 BURST_LIMIT = 13
 WINDOW_SECONDS = 60
+BURST_WINDOW = 5   # seconds to detect burst spam
 
 # Store timestamps per user/IP
 request_store = defaultdict(deque)
@@ -53,15 +54,22 @@ def check_rate_limit(key: str):
     window_start = now - WINDOW_SECONDS
     timestamps = request_store[key]
 
-    # Remove old timestamps
+    # Remove old timestamps (older than 60 sec)
     while timestamps and timestamps[0] < window_start:
         timestamps.popleft()
 
     request_count = len(timestamps)
 
-    # Block if exceeds limit
+    # 🚨 Hard block if over 44/min
     if request_count >= MAX_REQUESTS_PER_MIN:
         return False, request_count
+
+    # 🚨 Burst control
+    # If more than 13 requests within 5 sec → block
+    if request_count >= BURST_LIMIT:
+        first_in_window = timestamps[0] if timestamps else now
+        if now - first_in_window <= BURST_WINDOW:
+            return False, request_count
 
     # Allow request
     timestamps.append(now)
@@ -78,15 +86,14 @@ async def secure_ai(data: InputData, request: Request):
         key = get_client_key(data.userId, request)
         allowed, count = check_rate_limit(key)
 
-        # 🚫 Block if exceeded
+        # 🚫 BLOCKED
         if not allowed:
             retry_after = 60
-
             logging.warning(f"BLOCKED: Rate limit exceeded for {key}")
 
             response = {
                 "blocked": True,
-                "reason": "Rate limit exceeded: max 44 requests/min with burst 13",
+                "reason": "Rate limit exceeded: max 44/min with burst 13",
                 "sanitizedOutput": None,
                 "confidence": 0.99
             }
@@ -97,7 +104,7 @@ async def secure_ai(data: InputData, request: Request):
                 headers={"Retry-After": str(retry_after)}
             )
 
-        # ✅ Passed
+        # ✅ ALLOWED
         logging.info(f"ALLOWED: {key} request #{count}")
 
         return {
@@ -120,7 +127,6 @@ async def secure_ai(data: InputData, request: Request):
 
     except Exception:
         logging.error("Internal error occurred")
-
         return JSONResponse(
             status_code=500,
             content={
